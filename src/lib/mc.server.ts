@@ -174,11 +174,35 @@ function readMcPacket(host: string, port: number, payload: Buffer): Promise<Buff
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host, port, noDelay: true, family: 4 });
     let buf = Buffer.alloc(0);
+    let settled = false;
     const fail = (e: Error) => {
+      if (settled) return;
+      settled = true;
       socket.destroy();
       reject(e);
     };
-    socket.on("error", (e) => fail(e instanceof Error ? e : new Error(String(e))));
+    const ok = (v: Buffer) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(v);
+    };
+    socket.on("error", (e) => {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (buf.length && /ECONNRESET|EPIPE|ECONNABORTED/i.test(msg)) {
+        try {
+          const r = new Reader(buf);
+          const len = r.varInt();
+          if (r.remaining() >= len) {
+            ok(r.bytes(len));
+            return;
+          }
+        } catch {
+          /* fall through */
+        }
+      }
+      fail(e instanceof Error ? e : new Error(String(e)));
+    });
     socket.on("connect", () => socket.write(payload));
     socket.on("data", (chunk) => {
       buf = Buffer.concat([buf, chunk]);
@@ -186,9 +210,7 @@ function readMcPacket(host: string, port: number, payload: Buffer): Promise<Buff
         const r = new Reader(buf);
         const len = r.varInt();
         if (r.remaining() < len) return;
-        const packet = r.bytes(len);
-        socket.destroy();
-        resolve(packet);
+        ok(r.bytes(len));
       } catch {
         // wait for more bytes
       }
@@ -212,8 +234,8 @@ function rconPacket(id: number, type: number, body: string): Buffer {
   return buf;
 }
 
-function parseRconPackets(buf: Buffer): { id: number; type: number; body: string }[] {
-  const out: { id: number; type: number; body: string }[] = [];
+function parseRconPackets(buf: Buffer): { packets: { id: number; type: number; body: string }[]; rest: Buffer } {
+  const packets: { id: number; type: number; body: string }[] = [];
   let offset = 0;
   while (offset + 4 <= buf.length) {
     const len = buf.readInt32LE(offset);
@@ -221,10 +243,10 @@ function parseRconPackets(buf: Buffer): { id: number; type: number; body: string
     const id = buf.readInt32LE(offset + 4);
     const type = buf.readInt32LE(offset + 8);
     const body = buf.toString("utf8", offset + 12, offset + 4 + len - 2);
-    out.push({ id, type, body });
+    packets.push({ id, type, body });
     offset += 4 + len;
   }
-  return out;
+  return { packets, rest: buf.subarray(offset) };
 }
 
 export async function runRcon(
@@ -247,7 +269,10 @@ export async function runRcon(
     );
     return { ok: true, body: body || "(no output)", error: null };
   } catch (err) {
-    const message = err instanceof Error ? err.message : "RCON failed.";
+    const raw = err instanceof Error ? err.message : "RCON failed.";
+    const message = /ECONNRESET|EPIPE|ECONNABORTED/i.test(raw)
+      ? "Playit closed the console tunnel. Check that rcon.password matches and recruit-woof points at the RCON port."
+      : raw;
     return { ok: false, body: "", error: message };
   }
 }
@@ -257,38 +282,74 @@ function rconExchange(host: string, port: number, password: string, command: str
     const socket = net.connect({ host, port, noDelay: true, family: 4 });
     let buf = Buffer.alloc(0);
     let authed = false;
-    const fail = (e: Error) => {
+    let rejectedAuth = false;
+    let reply = "";
+    let settled = false;
+
+    const finishOk = (body: string) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(body);
+    };
+    const finishErr = (e: Error) => {
+      if (settled) return;
+      settled = true;
       socket.destroy();
       reject(e);
     };
-    socket.on("error", (e) => fail(e instanceof Error ? e : new Error(String(e))));
+
+    const consume = () => {
+      const parsed = parseRconPackets(buf);
+      buf = parsed.rest;
+      if (!authed) {
+        for (const pkt of parsed.packets) {
+          if (pkt.id === -1) {
+            rejectedAuth = true;
+            finishErr(new Error("RCON password was rejected."));
+            return;
+          }
+          if (pkt.id === 1) {
+            authed = true;
+            socket.write(rconPacket(2, 2, command));
+            break;
+          }
+        }
+        return;
+      }
+      const replies = parsed.packets.filter((p) => p.id === 2);
+      if (replies.length) {
+        reply += replies.map((p) => p.body).join("");
+        finishOk(reply);
+      }
+    };
+
+    const hangup = (err?: Error) => {
+      if (settled) return;
+      if (reply) {
+        finishOk(reply);
+        return;
+      }
+      if (rejectedAuth) {
+        finishErr(new Error("RCON password was rejected."));
+        return;
+      }
+      if (authed) {
+        finishOk("(no output)");
+        return;
+      }
+      finishErr(err ?? new Error("The console tunnel closed before login."));
+    };
+
+    socket.on("error", (e) => hangup(e instanceof Error ? e : new Error(String(e))));
     socket.on("connect", () => {
       socket.write(rconPacket(1, 3, password));
     });
     socket.on("data", (chunk) => {
       buf = Buffer.concat([buf, chunk]);
-      const packets = parseRconPackets(buf);
-      if (packets.length === 0) return;
-      if (!authed) {
-        const auth = packets[0]!;
-        if (auth.id === -1) {
-          fail(new Error("RCON password was rejected."));
-          return;
-        }
-        if (auth.id !== 1) return;
-        authed = true;
-        buf = Buffer.alloc(0);
-        socket.write(rconPacket(2, 2, command));
-        return;
-      }
-      const replies = packets.filter((p) => p.id === 2);
-      if (replies.length === 0) return;
-      socket.destroy();
-      resolve(replies.map((p) => p.body).join(""));
+      consume();
     });
-    socket.on("close", () => {
-      if (!authed) reject(new Error("The console tunnel closed before login."));
-    });
+    socket.on("close", () => hangup());
   });
 }
 
