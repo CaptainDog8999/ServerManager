@@ -31,12 +31,16 @@ export function parseEndpoint(raw: string): Endpoint {
     const port = Number(trimmed.slice(lastColon + 1));
     assertPort(port);
     if (!host) throw new Error("Address is missing a host.");
+    // Playit hostnames hide the real port in DNS. Ignore a typed 25565.
+    if (isPlayitHost(host) && port === 25565) {
+      return { host, port: 25565, raw: host };
+    }
     return { host, port, raw: `${host}:${port}` };
   }
 
   const host = trimmed.replace(/\.$/, "");
   if (!host.includes(".")) throw new Error("That does not look like a playit address.");
-  return { host, port: 25565, raw: `${host}:25565` };
+  return { host, port: 25565, raw: host };
 }
 
 function assertPort(port: number) {
@@ -46,6 +50,7 @@ function assertPort(port: number) {
 }
 
 export function formatEndpoint(ep: Endpoint): string {
+  if (isPlayitHost(ep.host)) return ep.host;
   return `${ep.host}:${ep.port}`;
 }
 
