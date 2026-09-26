@@ -1,9 +1,24 @@
 import net from "node:net";
+import dns from "node:dns/promises";
 import { flattenMotd } from "./motd";
 import { assertSafeEndpoint, type Endpoint } from "./endpoint";
 import type { GameStatus, RconResult } from "./types";
 
-const TIMEOUT_MS = 7000;
+const TIMEOUT_MS = 12000;
+
+async function resolveMinecraftTarget(host: string, port: number): Promise<{ host: string; port: number }> {
+  try {
+    const records = await dns.resolveSrv(`_minecraft._tcp.${host}`);
+    records.sort((a, b) => a.priority - b.priority || b.weight - a.weight);
+    const rec = records[0];
+    if (rec?.name && rec.port) {
+      return { host: rec.name.replace(/\.$/, ""), port: rec.port };
+    }
+  } catch {
+    // No SRV — use the address as pasted.
+  }
+  return { host, port };
+}
 
 function writeVarInt(value: number): Buffer {
   const parts: number[] = [];
@@ -99,19 +114,20 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 export async function pingMinecraft(ep: Endpoint): Promise<GameStatus> {
   assertSafeEndpoint(ep);
   const started = Date.now();
+  const target = await resolveMinecraftTarget(ep.host, ep.port);
   try {
     const handshake = frame(
       Buffer.concat([
         writeVarInt(0x00),
         writeVarInt(764),
         writeString(ep.host),
-        writeUShort(ep.port),
+        writeUShort(target.port),
         writeVarInt(1),
       ]),
     );
     const request = frame(writeVarInt(0x00));
     const packet = await withTimeout(
-      readMcPacket(ep.host, ep.port, Buffer.concat([handshake, request])),
+      readMcPacket(target.host, target.port, Buffer.concat([handshake, request])),
       TIMEOUT_MS,
       "Timed out waiting for the game tunnel.",
     );
@@ -156,7 +172,7 @@ export async function pingMinecraft(ep: Endpoint): Promise<GameStatus> {
 
 function readMcPacket(host: string, port: number, payload: Buffer): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const socket = net.connect({ host, port, noDelay: true });
+    const socket = net.connect({ host, port, noDelay: true, family: 4 });
     let buf = Buffer.alloc(0);
     const fail = (e: Error) => {
       socket.destroy();
@@ -222,9 +238,10 @@ export async function runRcon(
   if (command.length > 256) return { ok: false, body: "", error: "Command is too long." };
   if (command.includes("\0")) return { ok: false, body: "", error: "Invalid command." };
 
+  const target = await resolveMinecraftTarget(ep.host, ep.port);
   try {
     const body = await withTimeout(
-      rconExchange(ep.host, ep.port, password, command.trim()),
+      rconExchange(target.host, target.port, password, command.trim()),
       TIMEOUT_MS,
       "Timed out waiting for the console tunnel.",
     );
@@ -237,7 +254,7 @@ export async function runRcon(
 
 function rconExchange(host: string, port: number, password: string, command: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const socket = net.connect({ host, port, noDelay: true });
+    const socket = net.connect({ host, port, noDelay: true, family: 4 });
     let buf = Buffer.alloc(0);
     let authed = false;
     const fail = (e: Error) => {
@@ -315,7 +332,7 @@ export async function probeHttp(ep: Endpoint): Promise<GameStatus> {
 
 function httpGet(host: string, port: number): Promise<string> {
   return new Promise((resolve, reject) => {
-    const socket = net.connect({ host, port, noDelay: true });
+    const socket = net.connect({ host, port, noDelay: true, family: 4 });
     let buf = Buffer.alloc(0);
     const fail = (e: Error) => {
       socket.destroy();
