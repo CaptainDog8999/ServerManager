@@ -3,6 +3,7 @@ import { ArrowUp, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { demoCommand } from "@/lib/demo";
+import { formatEndpoint } from "@/lib/endpoint";
 import { runConsoleCommand } from "@/lib/relay";
 import { useDeck } from "@/lib/store";
 import { cn } from "@/lib/utils";
@@ -48,6 +49,7 @@ export function ConsolePanel() {
               data: {
                 host: connection.console.host,
                 port: connection.console.port,
+                raw: connection.console.raw || connection.console.host,
                 password: connection.rconPassword,
                 command: cmd,
               },
@@ -104,8 +106,8 @@ export function ConsolePanel() {
           <p className="text-xs text-ink-faint">
             {mode === "demo"
               ? "Demo session · commands stay on this device"
-              : canType
-                ? `${connection?.console.host}:${connection?.console.port}`
+              : canType && connection
+                ? formatEndpoint(connection.console)
                 : "Add an RCON password in settings to send commands"}
           </p>
         </div>
